@@ -2,23 +2,19 @@ import React, { useState, useEffect, useRef, forwardRef, useImperativeHandle } f
 import Map from 'ol/Map';
 import View from 'ol/View';
 import TileLayer from 'ol/layer/Tile';
-import OSM from 'ol/source/OSM';
-import TileWMS from 'ol/source/TileWMS';
 import VectorLayer from 'ol/layer/Vector';
 import VectorSource from 'ol/source/Vector';
+import TileWMS from 'ol/source/TileWMS';
 import { useNavigate } from 'react-router-dom';
-import { Fill, Stroke, Style } from 'ol/style.js';
-import { FullScreen, ScaleLine, defaults as defaultControls } from 'ol/control.js';
+import { Circle as CircleStyle, Fill, Stroke, Style, Text } from 'ol/style.js';
+import { defaults as defaultControls } from 'ol/control.js';
 import GeoJSON from 'ol/format/GeoJSON';
 import CheckBoxLayers from './Layers';
-import BackgroundButton from './backgroundButton';
-import Searchbar from './Searchbar';
 import * as olProj from 'ol/proj';
 
 const MapWrapper = forwardRef((props, ref) => {
     const [map, setMap] = useState();
     const [featuresLayer, setFeaturesLayer] = useState();
-    const [backgroundMap, setBackgroundMap] = useState('Landeskarte-farbe');
     const [layerVisibility, setLayerVisibility] = useState({
         rail: false,
         bus: false,
@@ -27,11 +23,33 @@ const MapWrapper = forwardRef((props, ref) => {
     });
     const desktopMinZoom = 8.3;
     const mobileMinZoom = 7.5;
-    const [toggleMenu, setToggleMenu] = useState(false);
     const mapElement = useRef();
     const mapRef = useRef();
     mapRef.current = map;
     const navigate = useNavigate();
+
+    const pointStyle = (feature) => {
+        return new Style({
+            image: new CircleStyle({
+                radius: 5,
+                fill: new Fill({ color: 'blue' }),
+                stroke: new Stroke({
+                    color: 'white',
+                    width: 2,
+                }),
+            }),
+            text: new Text({
+                text: feature.get('name'), // Mostra il nome dell'attributo
+                font: '12px Calibri,sans-serif',
+                fill: new Fill({ color: 'black' }),
+                stroke: new Stroke({
+                    color: 'white',
+                    width: 3,
+                }),
+                offsetY: -15, // Sposta l'etichetta sopra il punto
+            }),
+        });
+    };
 
     const featureStyle = (feature) => {
         const type = feature.get('type');
@@ -90,6 +108,8 @@ const MapWrapper = forwardRef((props, ref) => {
                         zIndex: 4, // Overlay secondary style on top
                     })
                 ];
+            case 'point':
+                return pointStyle(feature);
             default:
                 mainStrokeStyle = new Stroke({
                     color: 'black',
@@ -115,16 +135,27 @@ const MapWrapper = forwardRef((props, ref) => {
             style: featureStyle,
         });
 
+        const wmsLayer = new TileLayer({
+            source: new TileWMS({
+                url: 'http://localhost:8080/geoserver/oev/wms',
+                params: {
+                    'LAYERS': 'oev:ch.swisstopo.pixelkarte-farbe',
+                    'TILED': true,
+                },
+                serverType: 'geoserver',
+                transition: 0,
+            }),
+        });
+
         const initialMap = new Map({
             target: mapElement.current,
-            layers: [getBackgroundLayer(), initialFeaturesLayer],
+            layers: [wmsLayer, initialFeaturesLayer],
             view: new View({
                 projection: 'EPSG:3857',
                 center: [919705.97978, 5923388.48616],
                 zoom: 1,
                 maxZoom: 20,
                 minZoom: getMinZoom(),
-                extent: getBackgroundExtent(),
             }),
             controls: defaultControls({
                 attributionOptions: { collapsible: false },
@@ -133,10 +164,13 @@ const MapWrapper = forwardRef((props, ref) => {
 
         initialMap.on('click', (event) => {
             initialMap.forEachFeatureAtPixel(event.pixel, (feature) => {
-                const trainId = feature.get('train_id'); // Assuming the feature has a property train_id
-                const line_name = feature.get('line_name');
                 const type = feature.get('type');
-                navigate(`/InfoPage/${trainId}/${line_name}/${type}`);
+                
+                if (type !== 'point') {
+                    const trainId = feature.get('train_id');
+                    const line_name = feature.get('line_name');
+                    navigate(`/InfoPage/${trainId}/${line_name}/${type}`);
+                }
             });
         });
 
@@ -155,6 +189,34 @@ const MapWrapper = forwardRef((props, ref) => {
     };
 
     useEffect(() => {
+        fetchWFSFeatures(); // Fetch WFS features when the component is mounted
+    }, [featuresLayer]);
+
+    const fetchWFSFeatures = () => {
+        if (featuresLayer) {
+            const wfsUrl = 'http://localhost:8080/geoserver/oev/ows?service=WFS&version=1.0.0&request=GetFeature&typeName=oev%3AHaltestellen&maxFeatures=50&outputFormat=application%2Fjson';
+            fetch(wfsUrl)
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    const features = new GeoJSON().readFeatures(data, {
+                        featureProjection: 'EPSG:3857'
+                    });
+                    const source = featuresLayer.getSource();
+                    features.forEach(feature => {
+                        feature.setStyle(pointStyle(feature));
+                    });
+                    source.addFeatures(features);
+                })
+                .catch(error => console.error('Error fetching WFS data:', error));
+        }
+    };
+
+    useEffect(() => {
         fetchFeatures();
     }, [layerVisibility]);
 
@@ -165,21 +227,32 @@ const MapWrapper = forwardRef((props, ref) => {
             const extent = view.calculateExtent(currentMap.getSize());
             const newBbox = extent.map(coord => Math.round(coord)).join(',');
             const newZoom = Math.round(view.getZoom());
-
+    
             Object.keys(layerVisibility).forEach((layerType) => {
                 if (layerVisibility[layerType]) {
                     console.log(`Fetching data for layer: ${layerType}`);
-                    fetch(`http://10.175.23.153:8000/get_all_journey/?bbox=${newBbox}&key=5cc87b12d7c5370001c1d6559e7fd9aab7a44ca1b7692b2adfeb2602&zoom=${newZoom}&type=${layerType}`)
-                        .then(response => response.json())
-                        .then((fetchedFeatures) => {
-                            const wktOptions = {
-                                dataProjection: 'EPSG:3857',
-                                featureProjection: 'EPSG:3857'
-                            };
-                            const parsedFeatures = new GeoJSON().readFeatures(fetchedFeatures, wktOptions);
-                            const source = featuresLayer.getSource();
-                            console.log(`Adding features for layer: ${layerType}`, parsedFeatures);
-                            source.addFeatures(parsedFeatures.filter(feature => feature.get('type') === layerType));
+                    fetch(`http://${window.location.hostname}:8000/get_all_journey/?bbox=${newBbox}&key=yourkey&zoom=${newZoom}&type=${layerType}`) //Ihren key ersetzen
+                        .then(response => {
+                            if (!response.ok) {
+                                throw new Error(`HTTP error! status: ${response.status}`);
+                            }
+                            return response.text();
+                        })
+                        .then(text => {
+                            try {
+                                const fetchedFeatures = JSON.parse(text);
+                                const wktOptions = {
+                                    dataProjection: 'EPSG:3857',
+                                    featureProjection: 'EPSG:3857'
+                                };
+                                const parsedFeatures = new GeoJSON().readFeatures(fetchedFeatures, wktOptions);
+                                const source = featuresLayer.getSource();
+                                console.log(`Adding features for layer: ${layerType}`, parsedFeatures);
+                                source.addFeatures(parsedFeatures.filter(feature => feature.get('type') === layerType));
+                            } catch (error) {
+                                console.error('Error parsing JSON:', error);
+                                console.error('Response text:', text);
+                            }
                         })
                         .catch(error => console.error('Error fetching data:', error));
                 } else {
@@ -196,113 +269,6 @@ const MapWrapper = forwardRef((props, ref) => {
         getMap: () => mapRef.current
     }));
 
-    const getBackgroundLayer = () => {
-        switch (backgroundMap) {
-            case 'osm':
-                return new TileLayer({ source: new OSM() });
-            case 'Landeskarte-farbe':
-            case 'Landeskarte-grau':
-            case 'Luftbild':
-                return new TileLayer({
-                    source: new TileWMS({
-                        url: 'https://wms.geo.admin.ch/',
-                        crossOrigin: 'anonymous',
-                        attributions: '© <a href="http://www.geo.admin.ch/internet/geoportal/en/home.html">SWISSIMAGE / geo.admin.ch</a>',
-                        projection: 'EPSG:3857',
-                        params: {
-                            'LAYERS': getLayerName(backgroundMap),
-                            'FORMAT': 'image/jpeg'
-                        },
-                    })
-                });
-            default:
-                return new TileLayer({ source: new OSM() });
-        }
-    };
-
-    const getLayerName = (mapType) => {
-        switch (mapType) {
-            case 'Landeskarte-farbe':
-                return 'ch.swisstopo.pixelkarte-farbe';
-            case 'Landeskarte-grau':
-                return 'ch.swisstopo.pixelkarte-grau';
-            case 'Luftbild':
-                return 'ch.swisstopo.images-swissimage';
-            default:
-                return '';
-        }
-    };
-
-    const getBackgroundExtent = () => {
-        return [506943.5, 5652213.5, 1301728.5, 6191092];
-    };
-
-    const handleSearch = (stop) => {
-        if (stop) {
-            const view = map.getView();
-            const lonLat = [stop.lon, stop.lat];
-            const transformedCoords = olProj.fromLonLat(lonLat, 'EPSG:3857');
-            view.setCenter(transformedCoords);
-            view.setZoom(16);
-        } else {
-            alert('Stop not found.');
-        }
-    };
-
-    const handleBackgroundChange = (mapType) => {
-        setBackgroundMap(mapType);
-    };
-
-    const fetchGeoData = async (mapType) => {
-        try {
-            let geoServiceUrl;
-            switch (mapType) {
-                case 'Landeskarte-farbe':
-                    geoServiceUrl = 'https://wms.geo.admin.ch/?LAYERS=ch.swisstopo.swisstlm3d-wanderwege';
-                    break;
-                case 'Landeskarte-grau':
-                    geoServiceUrl = 'https://wms.geo.admin.ch/?LAYERS=ch.swisstopo.pixelkarte-grau';
-                    break;
-                case 'Luftbild':
-                    geoServiceUrl = 'https://wms.geo.admin.ch/?LAYERS=ch.swisstopo.swissimage-product';
-                    break;
-                case 'osm':
-                    console.log('OpenStreetMap è un servizio basato su vettori. Non è richiesta una chiamata separata per i dati geoservizi.');
-                    return;
-                default:
-                    console.error('Tipo di mappa non riconosciuto:', mapType);
-                    return;
-            }
-
-            const response = await fetch(geoServiceUrl);
-            if (!response.ok) {
-                throw new Error('Errore nel recupero dei dati geoservizi');
-            }
-            console.log("Dati geoservizi recuperati con successo per la mappa:", mapType);
-
-        } catch (error) {
-            console.error('Errore durante il recupero dei dati geoservizi:', error.message);
-        }
-    };
-
-    useEffect(() => {
-        if (map) {
-            const layers = map.getLayers().getArray();
-            layers[0] = getBackgroundLayer();
-            map.render();
-        }
-    }, [backgroundMap, map]);
-
-    useEffect(() => {
-        if (featuresLayer) {
-            const features = featuresLayer.getSource().getFeatures();
-            features.forEach(feature => {
-                const type = feature.get('type');
-                feature.setStyle(layerVisibility[type] ? featureStyle(feature) : null);
-            });
-        }
-    }, [layerVisibility, featuresLayer]);
-
     const handleLayerVisibilityChange = (layerType, isVisible) => {
         setLayerVisibility(prevState => ({
             ...prevState,
@@ -312,16 +278,10 @@ const MapWrapper = forwardRef((props, ref) => {
 
     return (
         <div style={{ position: 'relative', flex: "100 0 0" }}>
-            <Searchbar onSearch={handleSearch} />
             <CheckBoxLayers onLayerVisibilityChange={handleLayerVisibilityChange} />
             <div className="container">
                 <div className="white-overlay" style={{ zIndex: 1, backgroundColor: 'rgba(255, 255, 255, 0.2)', pointerEvents: 'none' }}></div>
                 <div ref={mapElement} className="map-container"></div>
-                <BackgroundButton
-                    setBackgroundMap={handleBackgroundChange}
-                    toggleMenu={toggleMenu}
-                    fetchGeoData={fetchGeoData}
-                />
             </div>
         </div>
     );
